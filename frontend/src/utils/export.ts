@@ -71,7 +71,10 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
+  // v1/v2 旧存档没有 occupancies，导入后由 db 层按当前水位 / 开度重排补建
+  const snapshot = data as DatabaseSnapshot;
+  if (!Array.isArray(snapshot.occupancies)) snapshot.occupancies = [];
+  return { ok: true, message: '存档校验通过。', snapshot };
 }
 
 /** 生成晒程进度汇总 CSV */

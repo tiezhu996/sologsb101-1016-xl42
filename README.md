@@ -41,7 +41,7 @@ docker compose up -d --build       # 改完代码后重新构建
 | 路由 | @solidjs/router 0.15 | `Router root={App}` 布局路由，全部路径支持深链刷新 |
 | 状态管理 | Solid 原生能力 | `createStore`（pondStore / scheduleStore）+ `createSignal`（observationStore），**不使用 Pinia / Zustand** |
 | UI | Tailwind CSS 3.4 | 全部界面手写 Tailwind，**不使用 Element Plus / Ant Design / Vue / React** |
-| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm` 并迁移旧记录 |
+| 本地持久化 | Dexie 4（IndexedDB） | 库名 `gbbrinepond`，`v1 → v2` 新增 `evapMm`，`v2 → v3` 新增池容占用账 `occupancies` 与走水路径 `routePondIds` |
 | 容器 | node:20-alpine → nginx:alpine | 多阶段构建，`chmod -R a+rX` 规避静态资源 403 |
 
 ---
@@ -69,13 +69,14 @@ sologsb101-1016/
         ├── index.tsx           # 入口：render + 初始化数据库
         ├── App.tsx             # 外壳：品牌栏 + 侧边导航 + 内容区（Router root 布局）
         ├── styles/main.css     # @tailwind 指令 + 全局样式
-        ├── types/              # pond.ts gate.ts observation.ts assay.ts schedule.ts
-        ├── stores/             # pondStore.ts observationStore.ts scheduleStore.ts
-        ├── components/common/  # StageTag.tsx FilterBar.tsx StatBadge.tsx EmptyPanel.tsx AppDialog.tsx
+        ├── types/              # pond.ts gate.ts observation.ts assay.ts schedule.ts occupancy.ts
+        ├── stores/             # pondStore.ts observationStore.ts scheduleStore.ts occupancyStore.ts
+        ├── components/common/  # StageTag FilterBar StatBadge EmptyPanel AppDialog OccupancyLedger PendingApproval
         ├── hooks/              # useEvaporation.ts useIdbTable.ts
         ├── pages/              # 6 个模块页面
         ├── router/index.tsx    # AppRouter + ROUTES 常量 + NAV_ITEMS
-        └── utils/              # brine.ts db.ts export.ts seed.ts id.ts
+        └── utils/              # brine.ts db.ts export.ts seed.ts id.ts occupancy.ts
+    └── scripts/                # 占用引擎 / DB / v2→v3 迁移的 Node 验证脚本（npm test）
 ```
 
 ---
@@ -88,7 +89,7 @@ sologsb101-1016/
 | `/gates` | `pages/GateConfig.tsx` | 串级走向与闸门配置：拓扑列表 + 开度就地编辑（滑块/数字），实时重算下游预计进水量 |
 | `/observations` | `pages/ObservationEntry.tsx` | 卤水日观测录入台：单条 + 批量粘贴录入，同池同日覆盖写入，蒸发量按经验公式自动估算 |
 | `/assays` | `pages/AssayEntry.tsx` | 离子组分分析：Li⁺/K⁺/Mg²⁺/Na⁺ 录入、自动达标判定（可人工覆盖）、SVG 组分曲线 |
-| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按日期排序、HTML5 拖拽调整先后顺序、逐条推进状态、出卤回写池阶段 |
+| `/schedules` | `pages/ScheduleBoard.tsx` | 走水与出卤编排：按路径和计划量预占下游池容、容量不足自动排队、待批区与池容占用账（已占/缺口/排队量）、拖拽排序、逐条推进状态 |
 | `/export` | `pages/ExportView.tsx` | 晒程进度汇总、JSON 结构版本查看与导入导出、CSV 汇总、重置演示数据 |
 
 `/` 重定向到 `/ponds`，未匹配路径统一回落到 `/ponds`。
@@ -101,11 +102,14 @@ sologsb101-1016/
 
 * **持久化方案**：IndexedDB，通过 Dexie 封装（`src/utils/db.ts`）。
 * **数据库名**：`gbbrinepond`。
-* **数据结构版本**：`DB_SCHEMA_VERSION = 2`
+* **数据结构版本**：`DB_SCHEMA_VERSION = 3`
   * `db.version(1)`：建立全部表与 **`pondId+date` 复合索引**（`observations`、`assays`）；
   * `db.version(2)`：**新增 `evapMm` 字段**并写入真实升级迁移逻辑 ——
     `.upgrade()` 里对 `observations` 逐行检查，缺失或非法时按密度/温度/水位/风力用经验公式回填默认值；
     同时补齐 `revision` / `createdAt` / `updatedAt`、`assays.verdictManual`、`schedules.orderIndex`。
+  * `db.version(3)`：**新增池容占用账 `occupancies` 表**（主键 `id`，索引 `scheduleId/pondId/granted/locked`），
+    `schedules` 新增走水路径 `routePondIds` 与超时标记 `expired`；旧计划在 `.upgrade()` 里
+    就地补齐默认路径 `[起点池]` 与 `expired=false`，升级后首次打开自动重排补建占用账。
 * **表结构**：
 
   | 表 | 主键 | 主要索引 |
@@ -114,7 +118,8 @@ sologsb101-1016/
   | `gates` | id | fromPondId, toPondId, state, openingPct |
   | `observations` | id | pondId, date, **[pondId+date]**, densityGcm3, evapMm |
   | `assays` | id | pondId, date, **[pondId+date]**, verdict, verdictManual |
-  | `schedules` | id | pondId, planDate, state, orderIndex |
+  | `schedules` | id | pondId, planDate, state, orderIndex, expired |
+  | `occupancies` | id（`occ-{scheduleId}--{pondId}`） | scheduleId, pondId, granted, locked |
 
 * **首屏演示数据**：`initDatabase()` 在打开数据库后检测 `ponds` 表是否为空，为空则调用 `utils/seed.ts` 播种，
   幂等且只执行一次。播种链路为 **蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排** 三层互相引用：
@@ -122,7 +127,7 @@ sologsb101-1016/
   * 4 条闸门串级（北-01→北-02→北-03、南-04→南-05、跨池系备用闸），1 条关闭用于验证开度联动；
   * 16 条卤水日观测（每池 2–4 条，密度随日期递增，`evapMm` 由经验公式生成）；
   * 6 条离子组分分析（覆盖达标 / 接近 / 未达标，其中 1 条为人工覆盖判定）；
-  * 5 条走水编排（覆盖待排 / 已排 / 走水中 / 已出卤四种状态）。
+  * 6 条走水编排（覆盖待排 / 已排 / 走水中 / 已出卤四种状态，外加容量排队、闸门断流、超时释放、现场锁定等占用场景）。
   * 固定 id 如 `pond-north-01`、`pond-south-04` 可直接用于验证与二次开发。
 * **其他本地数据**：`localStorage` 仅保存「最近选中的池系」这一界面偏好，不存业务数据。
 * 删除蒸发池会**级联清理**相关闸门（上下游任一为该池）、观测、化验与走水编排（同一 Dexie 事务内完成）。
@@ -142,6 +147,7 @@ npm run dev          # http://localhost:22816
 ```bash
 npm run build        # tsc --noEmit && vite build（零错误）
 npm run typecheck    # 仅做 TypeScript 类型检查
+npm test             # 占用引擎规则 + DB 事务 + v2→v3 迁移三组 Node 验证
 npm run preview      # 预览 dist 产物
 ```
 
@@ -157,3 +163,24 @@ npm run preview      # 预览 dist 产物
   判定达标的池自动进入**出卤候选**；人工覆盖只改写判定标注，原始化验数值保持不变。
 * **闸门过流估算**：`1.7 × 过流面积 × √水头 × 开度`，用于开度调整后的下游进水量即时反馈；开度变化会同步推导闸门状态（关闭 / 半开 / 全开）。
 * **出卤回写**：走水状态推进到「已出卤」时，蒸发池阶段自动推进（钠盐→钾盐→锂盐），并把最新一次观测的密度回写为实际密度。
+
+### 池容占用账（`src/utils/occupancy.ts`）
+
+解决「同一池系同时排几条走水计划、下游池接纳不下、现场才发现溢流」的问题：计划先预占、容量不足先排队，而不是到现场才发现。
+
+* **按路径 + 计划量预占**：每条计划携带走水路径 `routePondIds`（起点 → 各级下游池），沿路径逐闸下泄，
+  到达量 = 上一跳到达量 × `闸门开度%`；闸门关闭则路径断流、在断流池挂「闸门关闭」排队账。
+* **可用容量**：下游池可用容量 = 有效体积（面积 × 有效水深）− 当前存量（面积 × 最近观测水位；无观测按空池）。
+* **整单占用**：路径上**所有**下游池都容得下才拿到占用（`occupancies.granted=true`）；任一池容量不足则**整条计划**
+  留在「待批区」排队，并记录每个申请池的缺口 `shortfallM3`，不会部分预占。
+* **排队顺序**：已走水状态优先（走水中 > 已排 > 待排），同状态按提交时间 `createdAt` 先后；先到先得、逐条扣减账面剩余。
+* **现场事实照旧**：走水中计划的占用置 `locked=true`，水位或闸门开度变化后**只重算未执行计划**（待排/已排）的占用量，
+  走水中占用哪怕已超过账面余量（剩余为负 = 现场溢流）也保持不变。
+* **释放与补排**：取消（删除计划）、出卤（已出卤）立即释放占用；计划日已过仍未执行的视为**超时释放**（`expired`），
+  释放出的容量在同一次重排中按排队顺序自动补占，超时计划重新排上时清除超时标记。
+* **事务化重排 + 失败恢复重试**：所有重排都在覆盖 6 张业务表的 Dexie `rw` 事务内完成（失败整体回滚）；
+  手动「立即重排」入口（`reconcileAndPersist`）先存占用账快照，重排失败则**恢复原占用账并重试一次**，
+  再失败恢复原账并抛出，保证现场账不丢。
+* **汇总**：占用账面板按池显示已占容量、账面剩余、排队量、缺口与占用率，顶部汇总全局已占 / 缺口 / 排队量 / 排队条目数。
+* **开始走水门禁**：未拿到下游占用（仍在待批区）的「已排」计划不能推进到「走水中」，按钮禁用并提示。
+

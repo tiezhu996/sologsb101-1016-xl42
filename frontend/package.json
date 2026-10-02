@@ -8,7 +8,11 @@
     "dev": "vite --host --port 22816",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview --host --port 22816",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test:occupancy": "esbuild scripts/occupancy-engine.test.ts --bundle --platform=node --format=cjs --outfile=scripts/.occupancy-test.cjs && node scripts/.occupancy-test.cjs && rm -f scripts/.occupancy-test.cjs",
+    "test:occupancy:db": "esbuild scripts/occupancy-db.test.ts --bundle --platform=node --format=cjs --inject:scripts/fake-idb-env.ts --outfile=scripts/.occupancy-db-test.cjs && node scripts/.occupancy-db-test.cjs && rm -f scripts/.occupancy-db-test.cjs",
+    "test:occupancy:migrate": "esbuild scripts/occupancy-migrate.test.ts --bundle --platform=node --format=cjs --inject:scripts/fake-idb-env.ts --outfile=scripts/.occupancy-migrate-test.cjs && node scripts/.occupancy-migrate-test.cjs && rm -f scripts/.occupancy-migrate-test.cjs",
+    "test": "npm run test:occupancy && npm run test:occupancy:db && npm run test:occupancy:migrate"
   },
   "dependencies": {
     "@solidjs/router": "^0.15.1",
@@ -18,6 +22,7 @@
   "devDependencies": {
     "@types/node": "^22.20.4",
     "autoprefixer": "^10.4.20",
+    "fake-indexeddb": "^6.2.5",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
     "typescript": "~5.7.3",

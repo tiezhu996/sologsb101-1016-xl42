@@ -128,13 +128,20 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // ---------------- 走水编排（覆盖四种状态 + 占用排队 / 超时 / 锁定场景） ----------------
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    // 已排：500 m³ 沿 A→B(65%)→C(40%)，B 到 325 m³（余 360 可批），C 到 130 m³（余 252 可批）→ 拿到占用
+    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, routePondIds: [SEED_IDS.pondA, SEED_IDS.pondB, SEED_IDS.pondC], planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 500, operator: '韩江', state: '已排', orderIndex: 1, expired: false }),
+    // 已排：1600 m³ 沿 D→E(80%)，E 到 1280 m³（余 144）→ 容量不足，留在待批区排队
+    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, routePondIds: [SEED_IDS.pondD, SEED_IDS.pondE], planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2, expired: false }),
+    // 走水中：300 m³ 沿 B→C(40%)，C 到 120 m³，占用锁定为现场事实
+    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, routePondIds: [SEED_IDS.pondB, SEED_IDS.pondC], planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 300, operator: '韩江', state: '走水中', orderIndex: 3, expired: false }),
+    // 待排：C 为末端锂盐池，路径仅本池，无下游占用
+    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, routePondIds: [SEED_IDS.pondC], planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4, expired: false }),
+    // 已出卤：占用已释放
+    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, routePondIds: [SEED_IDS.pondE], planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5, expired: false }),
+    // 已排但计划日已过仍未执行：首次重排会超时释放并排队（E 余 144 < 1120）
+    wrap<Schedule>({ id: 'schedule-a2', pondId: SEED_IDS.pondA, routePondIds: [SEED_IDS.pondA, SEED_IDS.pondB, SEED_IDS.pondE], planDate: '2026-09-29', targetDensity: 1.12, volumeM3: 1400, operator: '韩江', state: '已排', orderIndex: 6, expired: false }),
   ];
 
   await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {

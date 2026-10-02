@@ -3,6 +3,7 @@
  * - 数据库名：gbbrinepond
  * - v1：建立全部表与 pondId+date 复合索引
  * - v2：新增 evapMm 字段并写入升级迁移逻辑，旧记录自动补齐默认值
+ * - v3：新增 occupancies 池容占用账表，走水计划新增 routePondIds / expired
  * 纯前端应用：不依赖任何后端服务或外部接口。
  */
 import Dexie, { type Table } from 'dexie';
@@ -10,19 +11,21 @@ import type { Pond } from '../types/pond';
 import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
+import type { Occupancy } from '../types/occupancy';
 import type { Schedule, ScheduleState } from '../types/schedule';
 import { estimateEvapMm } from './brine';
-import { nowIso } from './id';
+import { reconcileOccupancies } from './occupancy';
+import { nowIso, today } from './id';
 import { seedDatabase } from './seed';
 
 /** 数据库名 */
 export const DB_NAME = 'gbbrinepond';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_SCHEMA_VERSION = 2;
+export const DB_SCHEMA_VERSION = 3;
 
 /** 数据行结构修订号 */
-export const ROW_REVISION = 2;
+export const ROW_REVISION = 3;
 
 class BrinePondDatabase extends Dexie {
   ponds!: Table<Pond, string>;
@@ -30,6 +33,7 @@ class BrinePondDatabase extends Dexie {
   observations!: Table<Observation, string>;
   assays!: Table<Assay, string>;
   schedules!: Table<Schedule, string>;
+  occupancies!: Table<Occupancy, string>;
 
   constructor() {
     super(DB_NAME);
@@ -90,10 +94,36 @@ class BrinePondDatabase extends Dexie {
           }
         });
       });
+
+    // ---------- v3：池容占用账 ----------
+    // occupancies 建表；schedules 新增 routePondIds（非索引字段，升级时就地补默认路径）
+    // 与 expired。旧库升级后占用账为空，首次打开由 reconcileAndPersist 补排。
+    this.version(DB_SCHEMA_VERSION)
+      .stores({
+        ponds: 'id, code, seriesName, stage, status, createdAt, updatedAt',
+        gates: 'id, fromPondId, toPondId, state, openingPct',
+        observations: 'id, pondId, date, [pondId+date], densityGcm3, evapMm',
+        assays: 'id, pondId, date, [pondId+date], verdict, verdictManual',
+        schedules: 'id, pondId, planDate, state, orderIndex, expired',
+        occupancies: 'id, scheduleId, pondId, granted, locked',
+      })
+      .upgrade(async (tx) => {
+        await tx.table('schedules').toCollection().modify((row: Record<string, unknown>) => {
+          if (!Array.isArray(row.routePondIds)) row.routePondIds = [typeof row.pondId === 'string' ? row.pondId : ''];
+          if (typeof row.expired !== 'boolean') row.expired = false;
+          row.revision = ROW_REVISION;
+        });
+      });
   }
 }
 
 export const db = new BrinePondDatabase();
+
+/**
+ * 占用重排需要读全部业务表，因此所有「写完业务数据后重排」的事务都必须覆盖这 6 张表，
+ * 否则严格 IndexedDB 会因事务作用域缺少 object store 抛 NotFoundError。
+ */
+const RECONCILE_TABLES = [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.occupancies] as const;
 
 /* ------------------------------ 初始化与播种 ------------------------------ */
 
@@ -111,6 +141,10 @@ export function initDatabase(): Promise<void> {
       if ((await db.ponds.count()) === 0) {
         await seedDatabase();
       }
+      // 旧库升级（v3 迁移只补字段）或首次播种后占用账可能为空，统一补排一次
+      if ((await db.occupancies.count()) === 0 && (await db.schedules.count()) > 0) {
+        await reconcileAndPersist(today());
+      }
     })();
   }
   return initPromise;
@@ -124,19 +158,33 @@ export async function listPonds(): Promise<Pond[]> {
 }
 
 export async function putPond(row: Pond): Promise<void> {
-  await db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.ponds.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+    // 有效体积 / 水深变化会改变可容容量
+    await reconcileInTransaction(today());
+  });
 }
 
 /** 删除蒸发池，并级联清理相关闸门、观测、化验与走水计划 */
 export async function removePond(id: string): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
     const gates = await db.gates.toArray();
     const related = gates.filter((gate) => gate.fromPondId === id || gate.toPondId === id).map((gate) => gate.id);
     if (related.length > 0) await db.gates.bulkDelete(related);
     await db.observations.where('pondId').equals(id).delete();
     await db.assays.where('pondId').equals(id).delete();
+    const schedules = await db.schedules.where('pondId').equals(id).toArray();
     await db.schedules.where('pondId').equals(id).delete();
+    // 清理该池自身被占用 + 被删计划在下游池的占用
+    await db.occupancies.where('pondId').equals(id).delete();
+    if (schedules.length > 0) {
+      for (const schedule of schedules) {
+        await db.occupancies.where('scheduleId').equals(schedule.id).delete();
+      }
+    }
     await db.ponds.delete(id);
+    // 路径拓扑变了，未执行计划全部重排
+    await reconcileInTransaction(today());
   });
 }
 
@@ -147,16 +195,27 @@ export async function listGates(): Promise<Gate[]> {
 }
 
 export async function putGate(row: Gate): Promise<void> {
-  await db.gates.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.gates.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+    // 开度 / 走向变化后只重算未执行计划的占用量，走水中现场事实照旧
+    await reconcileInTransaction(today());
+  });
 }
 
-/** 就地调整开度：同步推导闸门状态 */
+/** 就地调整开度：同步推导闸门状态，并重排未执行计划的下游占用 */
 export async function updateGateOpening(id: string, openingPct: number, state: Gate['state']): Promise<void> {
-  await db.gates.update(id, { openingPct, state, updatedAt: nowIso() });
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.gates.update(id, { openingPct, state, updatedAt: nowIso() });
+    await reconcileInTransaction(today());
+  });
 }
 
 export async function removeGate(id: string): Promise<void> {
-  await db.gates.delete(id);
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.gates.delete(id);
+    // 闸被拆 / 关闭导致路径断流时，相关计划会在重排中挂账排队
+    await reconcileInTransaction(today());
+  });
 }
 
 /* ------------------------------ 卤水日观测 ------------------------------ */
@@ -189,12 +248,19 @@ export async function upsertObservation(row: Observation): Promise<Observation> 
     updatedAt: nowIso(),
     revision: ROW_REVISION,
   };
-  await db.observations.put(next);
+  // 水位变化后只重算未执行计划的占用量
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.observations.put(next);
+    await reconcileInTransaction(today());
+  });
   return next;
 }
 
 export async function removeObservation(id: string): Promise<void> {
-  await db.observations.delete(id);
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.observations.delete(id);
+    await reconcileInTransaction(today());
+  });
 }
 
 /* ------------------------------ 离子组分分析 ------------------------------ */
@@ -225,11 +291,20 @@ export async function listSchedules(): Promise<Schedule[]> {
 }
 
 export async function putSchedule(row: Schedule): Promise<void> {
-  await db.schedules.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.schedules.put({ ...row, updatedAt: nowIso(), revision: ROW_REVISION });
+    // 新计划 / 改路径 / 改计划量 / 改日期：未执行计划全部按新账重排
+    await reconcileInTransaction(today());
+  });
 }
 
+/** 取消走水计划：删除计划并释放其全部占用，释放出的容量由重排重新分配给排队条目 */
 export async function removeSchedule(id: string): Promise<void> {
-  await db.schedules.delete(id);
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.schedules.delete(id);
+    await db.occupancies.where('scheduleId').equals(id).delete();
+    await reconcileInTransaction(today());
+  });
 }
 
 /** 按给定 id 顺序重写排序序号（拖拽排序后调用） */
@@ -242,36 +317,127 @@ export async function reorderSchedules(orderedIds: string[]): Promise<void> {
 }
 
 /**
- * 出卤完成回写：把蒸发池推进到下一阶段，并把最新一次观测的密度对齐到实际密度。
+ * 出卤完成回写：把蒸发池推进到下一阶段，把最新一次观测的密度对齐到实际密度，
+ * 并释放该计划占用的下游容量，释放出的容量重新分配给排队条目。
  */
 export async function applyDischarge(scheduleId: string, actualDensity: number): Promise<void> {
-  await db.transaction('rw', db.ponds, db.schedules, db.observations, async () => {
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
     const schedule = await db.schedules.get(scheduleId);
     if (!schedule) return;
     await db.schedules.update(scheduleId, { state: '已出卤', updatedAt: nowIso() });
+    // 已出卤：占用账全部释放
+    await db.occupancies.where('scheduleId').equals(scheduleId).delete();
     const pond = await db.ponds.get(schedule.pondId);
-    if (!pond) return;
-    const nextStage: Pond['stage'] = pond.stage === '钠盐' ? '钾盐' : pond.stage === '钾盐' ? '锂盐' : '锂盐';
-    await db.ponds.update(pond.id, { stage: nextStage, updatedAt: nowIso() });
-    const list = await db.observations.where('pondId').equals(pond.id).toArray();
-    if (list.length === 0) return;
-    const latest = list.reduce((acc, item) => (item.date > acc.date ? item : acc));
-    const density = actualDensity > 0 ? actualDensity : latest.densityGcm3;
-    await db.observations.update(latest.id, {
-      densityGcm3: density,
-      evapMm: estimateEvapMm(density, latest.tempC, latest.levelCm, latest.windLevel),
-      updatedAt: nowIso(),
-    });
+    if (pond) {
+      const nextStage: Pond['stage'] = pond.stage === '钠盐' ? '钾盐' : pond.stage === '钾盐' ? '锂盐' : '锂盐';
+      await db.ponds.update(pond.id, { stage: nextStage, updatedAt: nowIso() });
+      const list = await db.observations.where('pondId').equals(pond.id).toArray();
+      if (list.length > 0) {
+        const latest = list.reduce((acc, item) => (item.date > acc.date ? item : acc));
+        const density = actualDensity > 0 ? actualDensity : latest.densityGcm3;
+        await db.observations.update(latest.id, {
+          densityGcm3: density,
+          evapMm: estimateEvapMm(density, latest.tempC, latest.levelCm, latest.windLevel),
+          updatedAt: nowIso(),
+        });
+      }
+    }
+    // 释放出的容量重新分配给排队条目
+    await reconcileInTransaction(today());
   });
 }
 
-/** 推进走水状态 */
-export async function advanceScheduleState(scheduleId: string, next: ScheduleState, actualDensity: number): Promise<void> {
+/** 推进走水状态；走水中 / 已出卤都会触发未执行计划重排 */
+export async function advanceScheduleState(
+  scheduleId: string,
+  next: ScheduleState,
+  actualDensity: number,
+): Promise<void> {
   if (next === '已出卤') {
     await applyDischarge(scheduleId, actualDensity);
     return;
   }
-  await db.schedules.update(scheduleId, { state: next, updatedAt: nowIso() });
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
+    await db.schedules.update(scheduleId, { state: next, updatedAt: nowIso() });
+    if (next === '走水中') {
+      // 进入走水中：该条占用转为现场事实（locked），其余未执行计划照旧排队
+      await reconcileInTransaction(today());
+    }
+  });
+}
+
+/* ---------------------------- 池容占用账 ---------------------------- */
+
+/**
+ * 在当前 Dexie 事务内重算并落库占用账。
+ * 必须在 rw 事务中调用：失败时整个事务回滚，调用方（reconcileAndPersist）
+ * 负责恢复原占用账快照并重试一次。
+ */
+async function reconcileInTransaction(todayDate: string): Promise<ReconcileResultLite> {
+  const [schedules, ponds, gates, observations, occupancies] = await Promise.all([
+    db.schedules.toArray(),
+    db.ponds.toArray(),
+    db.gates.toArray(),
+    db.observations.toArray(),
+    db.occupancies.toArray(),
+  ]);
+  const result = reconcileOccupancies({
+    schedules,
+    ponds,
+    gates,
+    observations,
+    occupancies,
+    today: todayDate,
+    nowIso,
+  });
+  await db.occupancies.clear();
+  if (result.occupancies.length > 0) await db.occupancies.bulkPut(result.occupancies);
+  // expired 标记变化的计划就地更新
+  for (const next of result.schedules) {
+    const old = schedules.find((row) => row.id === next.id);
+    if (old !== undefined && old.expired !== next.expired) {
+      await db.schedules.update(next.id, { expired: next.expired, updatedAt: nowIso() });
+    }
+  }
+  return {
+    expiredReleases: result.expiredReleases,
+    grantedCount: result.grantedCount,
+    queuedCount: result.queuedCount,
+  };
+}
+
+export interface ReconcileResultLite {
+  expiredReleases: number;
+  grantedCount: number;
+  queuedCount: number;
+}
+
+/**
+ * 手动重排（「立即重排」按钮 / 导入 / 重置 / 首次播种后）。
+ * 重排失败时恢复原占用账快照后重试一次；仍失败则抛出，由调用方提示。
+ */
+export async function reconcileAndPersist(todayDate = today()): Promise<ReconcileResultLite> {
+  // 事务本身具备原子性（失败自动回滚）；这里额外做快照恢复，保证重试基于原始账，
+  // 也覆盖极端情况下部分写入后抛错的恢复语义。
+  const snapshot = await db.occupancies.toArray();
+  try {
+    return await db.transaction('rw', [...RECONCILE_TABLES], async () => reconcileInTransaction(todayDate));
+  } catch (error) {
+    try {
+      await db.transaction('rw', db.occupancies, async () => {
+        await db.occupancies.clear();
+        if (snapshot.length > 0) await db.occupancies.bulkPut(snapshot);
+      });
+      return await db.transaction('rw', [...RECONCILE_TABLES], async () => reconcileInTransaction(todayDate));
+    } catch (retryError) {
+      // 重试仍失败：恢复原占用账，保证现场账不丢
+      await db.transaction('rw', db.occupancies, async () => {
+        await db.occupancies.clear();
+        if (snapshot.length > 0) await db.occupancies.bulkPut(snapshot);
+      });
+      throw retryError instanceof Error ? retryError : error;
+    }
+  }
 }
 
 /* ---------------------------- 整库快照 ---------------------------- */
@@ -285,56 +451,88 @@ export interface DatabaseSnapshot {
   observations: Observation[];
   assays: Assay[];
   schedules: Schedule[];
+  occupancies: Occupancy[];
 }
 
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [ponds, gates, observations, assays, schedules] = await Promise.all([
+  const [ponds, gates, observations, assays, schedules, occupancies] = await Promise.all([
     db.ponds.toArray(),
     db.gates.toArray(),
     db.observations.toArray(),
     db.assays.toArray(),
     db.schedules.toArray(),
+    db.occupancies.toArray(),
   ]);
-  return { name: DB_NAME, schemaVersion: DB_SCHEMA_VERSION, exportedAt: nowIso(), ponds, gates, observations, assays, schedules };
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_SCHEMA_VERSION,
+    exportedAt: nowIso(),
+    ponds,
+    gates,
+    observations,
+    assays,
+    schedules,
+    occupancies,
+  };
+}
+
+/** 给旧版（v1/v2）存档补齐 v3 字段，导入后统一重排占用账 */
+function migrateScheduleRow(row: Schedule): Schedule {
+  return {
+    ...row,
+    routePondIds: Array.isArray(row.routePondIds) ? row.routePondIds : [row.pondId],
+    expired: typeof row.expired === 'boolean' ? row.expired : false,
+    revision: ROW_REVISION,
+  };
 }
 
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
     await Promise.all([
       db.ponds.clear(),
       db.gates.clear(),
       db.observations.clear(),
       db.assays.clear(),
       db.schedules.clear(),
+      db.occupancies.clear(),
     ]);
     await db.ponds.bulkPut(snapshot.ponds.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.gates.bulkPut(snapshot.gates.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.observations.bulkPut(snapshot.observations.map((row) => ({ ...row, revision: ROW_REVISION })));
     await db.assays.bulkPut(snapshot.assays.map((row) => ({ ...row, revision: ROW_REVISION })));
-    await db.schedules.bulkPut(snapshot.schedules.map((row) => ({ ...row, revision: ROW_REVISION })));
+    const schedules = snapshot.schedules.map(migrateScheduleRow);
+    await db.schedules.bulkPut(schedules);
+    // 占用账以导入快照为准，再按当前水位 / 开度重排一次未执行计划
+    if (Array.isArray(snapshot.occupancies) && snapshot.occupancies.length > 0) {
+      await db.occupancies.bulkPut(snapshot.occupancies.map((row) => ({ ...row, revision: ROW_REVISION })));
+    }
+    await reconcileInTransaction(today());
   });
 }
 
 export async function resetDatabase(): Promise<void> {
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
+  await db.transaction('rw', [...RECONCILE_TABLES], async () => {
     await Promise.all([
       db.ponds.clear(),
       db.gates.clear(),
       db.observations.clear(),
       db.assays.clear(),
       db.schedules.clear(),
+      db.occupancies.clear(),
     ]);
+    await seedDatabase();
+    await reconcileInTransaction(today());
   });
-  await seedDatabase();
 }
 
 export async function countAll(): Promise<Record<string, number>> {
-  const [ponds, gates, observations, assays, schedules] = await Promise.all([
+  const [ponds, gates, observations, assays, schedules, occupancies] = await Promise.all([
     db.ponds.count(),
     db.gates.count(),
     db.observations.count(),
     db.assays.count(),
     db.schedules.count(),
+    db.occupancies.count(),
   ]);
-  return { ponds, gates, observations, assays, schedules };
+  return { ponds, gates, observations, assays, schedules, occupancies };
 }
