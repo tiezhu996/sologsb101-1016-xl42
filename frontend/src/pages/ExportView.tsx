@@ -7,6 +7,7 @@ import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
 import StageTag from '../components/common/StageTag';
 import { usePondStore } from '../stores/pondStore';
+import { useOccupancyStore } from '../stores/occupancyStore';
 import { DB_NAME, DB_SCHEMA_VERSION, exportSnapshot, importSnapshot, resetDatabase } from '../utils/db';
 import { buildBriefingText, copyText, exportProgressCsvFile, exportSnapshotJson, parseSnapshot } from '../utils/export';
 import { effectiveVerdict } from '../utils/brine';
@@ -17,12 +18,16 @@ const BTN_DANGER = 'rounded-md bg-rose-600 px-3.5 py-1.5 text-sm font-medium tex
 
 export default function ExportView() {
   const store = usePondStore();
+  const occupancyStore = useOccupancyStore();
   const [message, setMessage] = createSignal('');
   const [resetOpen, setResetOpen] = createSignal(false);
 
   onMount(() => {
     void store.loadAll();
   });
+
+  const occupancySummary = () => occupancyStore.state.result?.summary ?? null;
+  const ledgers = () => occupancyStore.state.result?.ledgers ?? {};
 
   const summary = createMemo(() => {
     const ponds = store.state.ponds;
@@ -57,6 +62,7 @@ export default function ExportView() {
       store.state.observations,
       store.state.assays,
       store.state.schedules,
+      ledgers(),
     );
     setMessage(`已导出晒程进度汇总 ${filename}`);
   };
@@ -109,11 +115,31 @@ export default function ExportView() {
         <StatBadge label="出卤候选池" value={summary().readyPonds} suffix="口" tone="success" />
         <StatBadge label="出卤完成率" value={`${summary().donePct}%`} percent={summary().donePct} tone="primary" />
         <StatBadge
+          label="未执行已占容量"
+          value={occupancySummary()?.reservedTotalM3 ?? 0}
+          suffix="m³"
+          tone="info"
+          hint="未执行走水计划在各下游池的预占容量合计"
+        />
+        <StatBadge
+          label="容量缺口"
+          value={occupancySummary()?.gapTotalM3 ?? 0}
+          suffix="m³"
+          tone="danger"
+          hint="排队条目对下游池的未满足预占量合计"
+        />
+        <StatBadge
+          label="排队量"
+          value={occupancySummary()?.queuedVolumeM3 ?? 0}
+          suffix={`m³ · ${occupancySummary()?.queuedCount ?? 0} 条`}
+          tone="warning"
+        />
+        <StatBadge
           label="数据结构版本"
           value={`v${DB_SCHEMA_VERSION}`}
           suffix={`· ${DB_NAME}`}
           tone="default"
-          hint="IndexedDB 库名与结构版本；v1 建表与 pondId+date 复合索引，v2 新增 evapMm 并迁移旧记录"
+          hint="IndexedDB 库名与结构版本；v3 新增 occupancies 池容占用账，v2 新增 evapMm，v1 建表与复合索引"
         />
       </div>
 
@@ -170,6 +196,8 @@ export default function ExportView() {
                   <th class="px-3 py-2">池系 / 阶段</th>
                   <th class="px-3 py-2 text-right">面积（㎡）</th>
                   <th class="px-3 py-2 text-right">有效体积（m³）</th>
+                  <th class="px-3 py-2 text-right">未执行预占（m³）</th>
+                  <th class="px-3 py-2 text-right">容量缺口（m³）</th>
                   <th class="px-3 py-2 text-right">观测条数</th>
                   <th class="px-3 py-2 text-right">当期密度</th>
                   <th class="px-3 py-2 text-right">最近蒸发量</th>
@@ -198,6 +226,18 @@ export default function ExportView() {
                         </td>
                         <td class="px-3 py-2.5 text-right tabular-nums">{pond.areaM2.toLocaleString('zh-CN')}</td>
                         <td class="px-3 py-2.5 text-right tabular-nums">{stat().volumeM3.toLocaleString('zh-CN')}</td>
+                        <td class="px-3 py-2.5 text-right tabular-nums text-emerald-700">
+                          {occupancyStore.ledgerOf(pond.id)?.reservedM3 ?? 0}
+                        </td>
+                        <td
+                          class={`px-3 py-2.5 text-right tabular-nums ${
+                            (occupancyStore.ledgerOf(pond.id)?.gapM3 ?? 0) > 0 ? 'font-medium text-rose-600' : 'text-slate-400'
+                          }`}
+                        >
+                          {(occupancyStore.ledgerOf(pond.id)?.gapM3 ?? 0) > 0
+                            ? occupancyStore.ledgerOf(pond.id)?.gapM3
+                            : '—'}
+                        </td>
                         <td class="px-3 py-2.5 text-right tabular-nums">{stat().observationCount}</td>
                         <td class="px-3 py-2.5 text-right tabular-nums text-brine-700">
                           {stat().currentDensity > 0 ? `${stat().currentDensity} g/cm³` : '—'}

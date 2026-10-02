@@ -14,9 +14,11 @@ import {
   putSchedule,
   removeSchedule,
   reorderSchedules,
+  ROW_REVISION,
 } from '../utils/db';
-import { nowIso, uuid } from '../utils/id';
+import { nowIso, today, uuid } from '../utils/id';
 import { usePondStore } from './pondStore';
+import { useOccupancyStore } from './occupancyStore';
 
 /** 走水编排筛选条件 */
 export interface ScheduleFilters {
@@ -84,12 +86,13 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      holdCancelledAt: null,
       createdAt: stamp,
       updatedAt: stamp,
-      revision: 2,
+      revision: ROW_REVISION,
     };
     await putSchedule(row);
-    setState('lastMessage', `已新建走水计划：${row.planDate}`);
+    setState('lastMessage', `已提交走水计划：${row.planDate}，正按下游池容排队占用`);
     return row;
   }
 
@@ -105,13 +108,14 @@ function createScheduleStore() {
       operator: draft.operator.trim(),
       state: draft.state,
       orderIndex: draft.orderIndex,
+      holdCancelledAt: existing.holdCancelledAt ?? null,
     });
-    setState('lastMessage', '走水计划已更新');
+    setState('lastMessage', '走水计划已更新，占用账按新路径 / 计划量重算');
   }
 
   async function deleteSchedule(scheduleId: string): Promise<void> {
     await removeSchedule(scheduleId);
-    setState('lastMessage', '走水计划已删除');
+    setState('lastMessage', '走水计划已删除，预占容量已释放，排队条目自动补位');
   }
 
   async function advance(scheduleId: string): Promise<ScheduleState | null> {
@@ -120,6 +124,16 @@ function createScheduleStore() {
     const index = SCHEDULE_STATE_FLOW.indexOf(existing.state);
     if (index < 0 || index >= SCHEDULE_STATE_FLOW.length - 1) return null;
     const next = SCHEDULE_STATE_FLOW[index + 1];
+    // 进入「走水」是现场事实的开始：必须已经拿到下游占用（无下游末端出卤除外），
+    // 排队 / 取消 / 超时的计划只能留在待批区，不能现场开闸。
+    if (next === '走水中') {
+      const occupancyStore = useOccupancyStore();
+      const entry = occupancyStore.entryOf(scheduleId);
+      if (entry !== null && entry.holdState !== '已批占用' && entry.holdState !== '无下游') {
+        setState('lastMessage', `该计划当前为「${entry.holdState}」，未拿到下游容量占用，不能开始走水`);
+        return null;
+      }
+    }
     const pondStore = usePondStore();
     const stat = pondStore.statOf(existing.pondId);
     const actualDensity = stat.currentDensity > 0 ? stat.currentDensity : existing.targetDensity;
@@ -129,9 +143,18 @@ function createScheduleStore() {
       'lastMessage',
       next === '已出卤'
         ? `已出卤：池阶段已推进，实际密度回写为 ${actualDensity} g/cm³`
-        : `状态已推进为「${next}」`,
+        : `状态已推进为「${next}」，占用账转为现场事实`,
     );
     return next;
+  }
+
+  /** 超时重报：把计划日期延到今天，重新进入占用排队（已释放的容量若够则立即补占） */
+  async function requeueExpired(scheduleId: string): Promise<void> {
+    const existing = state.rows.find((row) => row.id === scheduleId);
+    if (existing === undefined) return;
+    const stamp = nowIso();
+    await putSchedule({ ...existing, planDate: today(), holdCancelledAt: null, updatedAt: stamp });
+    setState('lastMessage', '已延期重报，计划重新参与下游容量排队');
   }
 
   /** 拖拽排序：把 fromId 移动到 toId 之前 */
@@ -170,6 +193,7 @@ function createScheduleStore() {
     updateSchedule,
     deleteSchedule,
     advance,
+    requeueExpired,
     moveBefore,
     moveToIndex,
   };

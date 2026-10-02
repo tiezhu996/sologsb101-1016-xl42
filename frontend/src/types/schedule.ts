@@ -27,6 +27,8 @@ export interface Schedule {
   state: ScheduleState
   /** 手工拖拽后的排序序号，越小越先走水 */
   orderIndex: number
+  /** 取消预占时间（ISO）：非空表示调度员主动释放占用，计划保留在待批区；null 为正常参与占用分配 */
+  holdCancelledAt: string | null
   createdAt: string
   updatedAt: string
   revision: number

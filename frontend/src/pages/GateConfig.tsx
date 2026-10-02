@@ -137,7 +137,9 @@ export default function GateConfig() {
   const adjustOpening = async (gate: Gate, openingPct: number): Promise<void> => {
     const clamped = Math.max(0, Math.min(100, Math.round(openingPct)));
     await updateGateOpening(gate.id, clamped, stateFromOpening(clamped));
-    setMessage(`已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%`);
+    setMessage(
+      `已把 ${pondLabel(gate.fromPondId)} → ${pondLabel(gate.toPondId)} 的开度调整为 ${clamped}%，走水路径与未执行计划的占用量已按新开度重算（现场事实照旧）`,
+    );
   };
 
   return (

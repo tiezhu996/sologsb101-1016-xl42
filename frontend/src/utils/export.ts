@@ -8,6 +8,7 @@ import type { Pond } from '../types/pond';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { PondLedger } from '../types/occupancy';
 import { effectiveVerdict, pondVolumeM3, round1 } from './brine';
 import { stampSuffix } from './id';
 
@@ -71,11 +72,23 @@ export function parseSnapshot(text: string): SnapshotParseResult {
       return { ok: false, message: `存档缺少 ${String(key)} 数组。`, snapshot: null };
     }
   }
-  return { ok: true, message: '存档校验通过。', snapshot: data as DatabaseSnapshot };
+  // v2 及更早存档没有 occupancies：导入后由 rebuildOccupancies 自动补建
+  if (data.occupancies !== undefined && !Array.isArray(data.occupancies)) {
+    return { ok: false, message: '存档 occupancies 字段格式不正确（应为数组）。', snapshot: null };
+  }
+  const snapshot = data as DatabaseSnapshot;
+  if (!Array.isArray(snapshot.occupancies)) snapshot.occupancies = [];
+  return { ok: true, message: '存档校验通过。', snapshot };
 }
 
 /** 生成晒程进度汇总 CSV */
-export function buildProgressCsv(ponds: Pond[], observations: Observation[], assays: Assay[], schedules: Schedule[]): string {
+export function buildProgressCsv(
+  ponds: Pond[],
+  observations: Observation[],
+  assays: Assay[],
+  schedules: Schedule[],
+  ledgers?: Record<string, PondLedger>,
+): string {
   const header = [
     '池号',
     '池系',
@@ -84,6 +97,10 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     '面积(㎡)',
     '有效水深(cm)',
     '有效体积(m³)',
+    '当前存量(m³)',
+    '未执行预占(m³)',
+    '现场台账(m³)',
+    '容量缺口(m³)',
     '观测条数',
     '最近观测日期',
     '最近密度(g/cm³)',
@@ -100,6 +117,7 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
     const pondAssays = assays.filter((row) => row.pondId === pond.id).sort((a, b) => a.date.localeCompare(b.date));
     const latestAssay = pondAssays.length > 0 ? pondAssays[pondAssays.length - 1] : null;
     const pondSchedules = schedules.filter((row) => row.pondId === pond.id);
+    const ledger = ledgers?.[pond.id];
     lines.push(
       [
         pond.code,
@@ -109,6 +127,10 @@ export function buildProgressCsv(ponds: Pond[], observations: Observation[], ass
         pond.areaM2,
         pond.depthCm,
         pondVolumeM3(pond.areaM2, pond.depthCm),
+        ledger?.storedM3 ?? '',
+        ledger?.reservedM3 ?? '',
+        ledger?.factualM3 ?? '',
+        ledger?.gapM3 ?? '',
         pondObs.length,
         latestObs === null ? '—' : latestObs.date,
         latestObs === null ? 0 : latestObs.densityGcm3,
@@ -131,9 +153,10 @@ export function exportProgressCsvFile(
   observations: Observation[],
   assays: Assay[],
   schedules: Schedule[],
+  ledgers?: Record<string, PondLedger>,
 ): string {
   const filename = `盐湖晒程进度汇总-${stampSuffix()}.csv`;
-  download(filename, buildProgressCsv(ponds, observations, assays, schedules), 'text/csv;charset=utf-8');
+  download(filename, buildProgressCsv(ponds, observations, assays, schedules, ledgers), 'text/csv;charset=utf-8');
   return filename;
 }
 

@@ -1,6 +1,6 @@
 /**
  * 演示数据播种（幂等）
- * 父 → 子 → 孙三层链路：蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排
+ * 父 → 子 → 孙三层链路：蒸发池 → 闸门串级 / 卤水日观测 → 离子组分分析 → 走水编排 → 池容占用账
  * 所有 id 固定，保证 /gates、/observations、/assays、/schedules 打开就有真实串级与数据。
  */
 import { db, ROW_REVISION } from './db';
@@ -9,9 +9,14 @@ import type { Gate } from '../types/gate';
 import type { Observation } from '../types/observation';
 import type { Assay } from '../types/assay';
 import type { Schedule } from '../types/schedule';
+import type { Occupancy } from '../types/occupancy';
 import { autoVerdict, estimateEvapMm } from './brine';
+import { allocateOccupancy, buildDesiredOccupancies, latestLevels } from './occupancy';
 
 const SEED_TIME = '2026-09-01T00:30:00.000Z';
+
+/** 占用评估基准日：与「今天」对齐，保证演示数据的超时 / 排队状态开箱即见 */
+const SEED_TODAY = '2026-10-02';
 
 /** 固定 id，便于文档与深链验证 */
 export const SEED_IDS = {
@@ -74,6 +79,35 @@ function assay(
   });
 }
 
+/** 走水计划的便捷构造（占用取消标记默认关闭，createdAt 可显式指定用于演示排队顺序） */
+function schedule(
+  id: string,
+  pondId: string,
+  planDate: string,
+  targetDensity: number,
+  volumeM3: number,
+  operator: string,
+  state: Schedule['state'],
+  orderIndex: number,
+  createdAt: string = SEED_TIME,
+  holdCancelledAt: string | null = null,
+): Schedule {
+  return {
+    id,
+    pondId,
+    planDate,
+    targetDensity,
+    volumeM3,
+    operator,
+    state,
+    orderIndex,
+    holdCancelledAt,
+    createdAt,
+    updatedAt: SEED_TIME,
+    revision: ROW_REVISION,
+  };
+}
+
 export async function seedDatabase(): Promise<void> {
   const exists = await db.ponds.count();
   if (exists > 0) return;
@@ -128,20 +162,43 @@ export async function seedDatabase(): Promise<void> {
     }),
   ];
 
-  // ---------------- 走水编排（覆盖四种状态，orderIndex 决定先后） ----------------
+  // ---------------- 走水编排（覆盖已批占用 / 排队 / 取消 / 超时 / 现场事实） ----------------
+  // 排队顺序：已排优先于待排，同状态按 createdAt；北-02 / 南-05 空余有限，后批计划会排队。
   const schedules: Schedule[] = [
-    wrap<Schedule>({ id: 'schedule-a1', pondId: SEED_IDS.pondA, planDate: '2026-10-02', targetDensity: 1.115, volumeM3: 1200, operator: '韩江', state: '已排', orderIndex: 1 }),
-    wrap<Schedule>({ id: 'schedule-d1', pondId: SEED_IDS.pondD, planDate: '2026-10-04', targetDensity: 1.098, volumeM3: 1600, operator: '王锐', state: '已排', orderIndex: 2 }),
-    wrap<Schedule>({ id: 'schedule-b1', pondId: SEED_IDS.pondB, planDate: '2026-10-06', targetDensity: 1.175, volumeM3: 900, operator: '韩江', state: '走水中', orderIndex: 3 }),
-    wrap<Schedule>({ id: 'schedule-c1', pondId: SEED_IDS.pondC, planDate: '2026-10-12', targetDensity: 1.255, volumeM3: 600, operator: '李文', state: '待排', orderIndex: 4 }),
-    wrap<Schedule>({ id: 'schedule-e1', pondId: SEED_IDS.pondE, planDate: '2026-09-28', targetDensity: 1.15, volumeM3: 700, operator: '王锐', state: '已出卤', orderIndex: 5 }),
+    schedule('schedule-a1', SEED_IDS.pondA, '2026-10-02', 1.115, 250, '韩江', '已排', 1, '2026-09-25T08:00:00.000Z'),
+    schedule('schedule-d1', SEED_IDS.pondD, '2026-10-04', 1.098, 120, '王锐', '已排', 2, '2026-09-25T08:20:00.000Z'),
+    schedule('schedule-b1', SEED_IDS.pondB, '2026-10-06', 1.175, 700, '韩江', '已排', 3, '2026-09-26T09:00:00.000Z'),
+    schedule('schedule-a2', SEED_IDS.pondA, '2026-10-08', 1.12, 1500, '韩江', '待排', 4, '2026-09-28T10:00:00.000Z'),
+    schedule('schedule-b2', SEED_IDS.pondB, '2026-10-09', 1.18, 600, '李文', '待排', 5, '2026-09-28T11:00:00.000Z'),
+    schedule('schedule-d2', SEED_IDS.pondD, '2026-10-10', 1.1, 1100, '王锐', '待排', 6, '2026-09-29T09:30:00.000Z'),
+    schedule('schedule-d3', SEED_IDS.pondD, '2026-10-11', 1.102, 300, '王锐', '待排', 7, '2026-09-29T10:00:00.000Z'),
+    schedule('schedule-a3', SEED_IDS.pondA, '2026-10-12', 1.125, 1000, '韩江', '待排', 8, '2026-09-30T08:00:00.000Z', '2026-09-30T12:00:00.000Z'),
+    schedule('schedule-d4', SEED_IDS.pondD, '2026-09-27', 1.095, 1400, '王锐', '待排', 9, '2026-09-20T08:00:00.000Z'),
+    schedule('schedule-run1', SEED_IDS.pondB, '2026-10-01', 1.172, 500, '韩江', '走水中', 10, '2026-09-24T08:00:00.000Z'),
+    schedule('schedule-e1', SEED_IDS.pondE, '2026-09-28', 1.15, 700, '王锐', '已出卤', 11, '2026-09-18T08:00:00.000Z'),
   ];
 
-  await db.transaction('rw', db.ponds, db.gates, db.observations, db.assays, db.schedules, async () => {
-    await db.ponds.bulkPut(ponds);
-    await db.gates.bulkPut(gates);
-    await db.observations.bulkPut(observations);
-    await db.assays.bulkPut(assays);
-    await db.schedules.bulkPut(schedules);
+  // ---------------- 池容占用账（由占用引擎按池容 / 水位 / 闸门 / 计划量算出） ----------------
+  const allocation = allocateOccupancy({
+    ponds,
+    gates,
+    schedules,
+    levelsByPond: latestLevels(observations),
+    occupancies: [],
+    today: SEED_TODAY,
   });
+  const occupancies: Occupancy[] = buildDesiredOccupancies(allocation, schedules, [], SEED_TIME, ROW_REVISION);
+
+  await db.transaction(
+    'rw',
+    [db.ponds, db.gates, db.observations, db.assays, db.schedules, db.occupancies],
+    async () => {
+      await db.ponds.bulkPut(ponds);
+      await db.gates.bulkPut(gates);
+      await db.observations.bulkPut(observations);
+      await db.assays.bulkPut(assays);
+      await db.schedules.bulkPut(schedules);
+      await db.occupancies.bulkPut(occupancies);
+    },
+  );
 }
